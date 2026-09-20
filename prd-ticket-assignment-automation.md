@@ -105,7 +105,13 @@ For each availability window, the lead should be able to define:
 
 The lead should also be able to edit or remove an existing availability window.
 
-An agent is considered available when the current time falls inside at least one availability window associated with that agent.
+Invalid availability windows should not be saved. The UI should show a clear validation error for configurations such as an unknown timezone, no valid agents, or an agent that does not belong to the company. A start and end time must be provided; equal start and end times are invalid, while end times earlier than the start time represent an overnight window.
+
+If an existing availability window later contains a stale agent reference because that agent was removed from the company, the UI should visibly flag the affected window. The stale agent should not be considered for availability or assignment until the schedule is corrected.
+
+An agent is considered available when the current time falls within at least one configured availability window associated with that agent. Availability windows are start-inclusive and end-exclusive: the agent becomes available at the configured start time and is no longer available at the configured end time.
+
+If an availability window crosses midnight, the selected weekday represents the day on which the window starts. For example, a Monday 22:00–06:00 window represents availability from Monday 22:00 until Tuesday 06:00.
 
 Availability should be evaluated in the configured timezone.
 
@@ -155,6 +161,10 @@ For this trial, fairness is defined as:
 
 1. Prefer the eligible agent with the fewest active tickets.
 2. If multiple agents have the same active ticket count, prefer the agent who was assigned a ticket least recently.
+3. An agent who has never received a ticket is considered less recently assigned than any agent who has previously received one.
+4. If multiple agents are still tied, use the agent's unique ID in ascending order as the final deterministic tie-breaker.
+
+The final ID-based tie-breaker does not represent a fairness preference; it only ensures that identical assignment inputs always produce the same result.
 
 This keeps the rule easy to understand and ensures that work is spread across the currently eligible team instead of relying only on a fixed rotation.
 
@@ -173,9 +183,13 @@ The assignment service should:
 4. Apply the fairness rule.
 5. Return the selected assignee.
 
-The assignment service is assumed to have access to the current workload and previous assignment information required to evaluate fairness.
+The first successful assignment request for a given company_id and ticket_id establishes that ticket’s assignment decision for the trial.
 
-The exact API schema, persistence strategy, and internal data model will be defined in `implementation.md`.
+Repeated requests for the same company_id and ticket_id should return the same assignee and should not count the ticket toward workload or assignment history more than once.
+
+The assignment service therefore behaves idempotently for repeated requests. The exact persistence mechanism used to preserve this behavior will be defined in implementation.md.
+
+The exact API schema, persistence mechanism, and internal data model used to support this behavior will be defined in implementation.md.
 
 ### 5.7 Explain Assignment Decisions
 
@@ -195,98 +209,52 @@ There may be times when no valid assignee exists, for example:
 - No agents are currently available.
 - Agents are available, but all have reached the team's active-ticket limit.
 
-For this trial, the system will not assign a ticket to an unavailable or overloaded agent only to force ownership.
+In these cases, the system will not assign the ticket to an unavailable or overloaded agent only to force ownership.
 
-Instead, the assignment API returns no assignee together with a clear reason.
+For this trial, this is handled as an explicit pending assignment state. The assignment API returns no assignee together with a clear reason explaining why assignment could not be completed.
 
-A fallback owner, queue, or escalation policy is outside the scope of this trial.
+A ticket in the pending assignment state may be retried by calling the assignment API again after availability or workload conditions change. Unsuccessful attempts do not establish an assignment or affect workload/history. Once a retry successfully selects an agent, that assignment becomes the ticket's assignment decision.
 
-## 6. Availability and Assignment Rules
+Automatically scheduling retries, fallback owners, queues, and escalation policies are outside the scope of this trial.
 
-### Availability
 
-Availability is based on recurring weekly schedules.
-
-- Schedules use named timezones.
-- An agent may belong to more than one availability window.
-- Holiday calendars and one-off overrides are outside the scope of this trial.
-
-### Active Workload
-
-Active workload is the number of tickets assigned to an agent that the existing ticket system considers non-terminal.
-
-The assignment service does not define the ticket lifecycle itself.
-
-An agent is considered overloaded when their active workload reaches the team's configured active-ticket limit.
-
-### Fairness
-
-Among eligible agents:
-
-- Prefer the agent with the fewest active tickets.
-- Use least-recently-assigned as the tie-breaker.
-
-### Explainability
-
-Every assignment outcome should be understandable as a sequence of eligibility and fairness decisions rather than a black-box result.
-
-## 7. Assumptions
+## 6. Trial Assumptions and Simplifications
 
 For this trial:
 
-- Companies, agents, and tickets already exist.
-- Company, agent, ticket, ticket-status, workload, and previous assignment data may be represented through seeded or stubbed data.
-- Availability is represented using recurring weekly schedules.
-- Named timezones are used instead of fixed UTC offsets.
-- Each company has a support timezone.
-- Each company already has recurring required support hours.
-- Active workload can be derived from the existing or stubbed ticket data.
-- The existing or stubbed ticket system determines which ticket states are terminal or non-terminal.
-- Each company has a shared maximum active-ticket limit per agent.
-- The assignment service has access to the workload and previous assignment information required to apply the fairness rule.
-- The assignment service returns who should be assigned; it does not need to create companies, agents, or tickets.
-- If no eligible agent exists, the API returns no assignee with a clear reason.
+- Companies, agents, and tickets already exist and may be represented using seeded or stubbed data.
+- Ticket status, current workload, and previous assignment information are assumed to be available to the assignment service.
+- Each company already has required support hours, a support timezone, and a configured active-ticket limit per agent.
+- The existing or stubbed ticket data determines whether a ticket is terminal or still contributes to active workload.
+- Automatic retry scheduling, fallback queues, and escalation policies are outside the scope of the trial.
 
-## 8. Acceptance Criteria
+## 7. Acceptance Criteria
 
 ### Availability Management
 
-- A team lead can create a recurring availability window with days, start time, end time, timezone, and agents.
-- Existing availability can be edited or removed.
-- Availability changes affect future assignment decisions.
+- A team lead can create, edit, and remove recurring availability windows.
+- Invalid availability configurations are rejected with a visible error.
+- Stale agent references are visibly flagged and are not used for assignment.
+- Availability behavior at schedule boundaries and across midnight follows the rules defined in Section 5.1.
 
 ### Coverage
 
-- The UI shows recurring team availability.
-- The coverage view is rendered in the company's support timezone.
-- The UI identifies periods inside required support hours where no agents are scheduled.
+- The UI shows recurring team availability in the company's support timezone.
+- Coverage gaps inside the company's required support hours are clearly visible.
 
 ### Assignment
 
-Given a valid `company_id` and `ticket_id`:
-
-- Only agents belonging to the company are considered.
-- Only agents who are currently available are considered.
-- Agents at the team's active-ticket limit are excluded.
-- The eligible agent with the fewest active tickets is selected.
-- If multiple eligible agents have the same active ticket count, the least-recently-assigned agent is selected.
+- A valid assignment request returns an eligible assignee according to the rules defined in Section 5.
+- A successful assignment is stable for repeated requests for the same company and ticket and does not affect workload/history more than once.
+- When no eligible agent exists, the result enters the defined pending-assignment behavior and clearly explains why assignment could not be completed.
+- A pending assignment can be retried after availability or workload conditions change.
 
 ### Explainability
 
-For a successful assignment, the system can explain:
+- A successful assignment identifies the selected agent and why they were selected.
+- An unsuccessful assignment clearly identifies the reason it could not be completed.
 
-- who was selected,
-- why they were eligible,
-- and which fairness rule caused them to be selected.
-
-### No Eligible Agent
-
-If no valid assignee exists:
-
-- the system does not silently assign an unavailable or overloaded agent,
-- and the result identifies why assignment could not be made.
-
-## 9. Scope Summary
+## 8. Scope Summary
 
 This trial focuses on two product capabilities:
 

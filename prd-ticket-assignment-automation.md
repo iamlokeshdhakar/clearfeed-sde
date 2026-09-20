@@ -152,11 +152,15 @@ When an assignment cannot be made, the result should expose the main reason, suc
 
 If no valid assignee exists, the system should not assign the ticket to an unavailable or overloaded agent only to force ownership.
 
-For this trial, the ticket enters an explicit **pending assignment** state. The API returns no assignee together with a clear reason.
+The ticket enters an explicit pending assignment state, and the assignment result includes a clear reason such as no_available_agent or all_available_agents_at_capacity.
 
-A pending assignment can be retried by calling the assignment API again after availability or workload conditions change. Unsuccessful attempts do not affect workload or assignment history. The first successful retry establishes the stable assignment decision described in Section 4.5.
+Pending assignments are automatically retried every 5 minutes using the same availability, workload, and fairness rules.
 
-Automatic retry scheduling, fallback owners, queues, and escalation policies are outside the scope of this trial.
+If an eligible agent becomes available, the retry establishes the ticket's assignment using the same stable/idempotent behavior defined in Section 4.5. If no agent is eligible, the ticket remains pending and is evaluated again on the next retry.
+
+Automatic retry is intentionally simple for the trial. A fixed retry interval avoids tickets remaining indefinitely unassigned without introducing a more complex scheduling, fallback-owner, or escalation system.
+
+Fallback owners, queues, and escalation policies remain outside the scope of this trial.
 
 ## 5. Trial Assumptions and Simplifications
 
@@ -198,6 +202,8 @@ For this trial:
 - When no eligible agent exists, the API returns a pending-assignment result with a clear reason.
 - An unsuccessful attempt does not affect workload or assignment history.
 - The request can be retried after availability or workload changes.
+- Pending assignments are automatically re-evaluated every 5 minutes.
+- Once a retry successfully assigns the ticket, it leaves the pending state and is not assigned again by later retries.
 
 ### Explainability
 

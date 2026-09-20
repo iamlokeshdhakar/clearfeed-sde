@@ -27,7 +27,7 @@ The following are outside the scope of this trial:
 - Creating or managing companies, agents, or tickets.
 - Skills-based, priority-based, or SLA-based routing.
 - Escalation policies, notifications, and historical analytics.
-- Automatic retry scheduling or fallback queues.
+- Fallback owners and fallback queues.
 
 ## 3. Users and System Actor
 
@@ -173,7 +173,7 @@ For this trial:
 - Each company has a shared maximum active-ticket limit per agent.
 - Availability is represented using recurring weekly schedules and named timezones.
 - The assignment service does not create companies, agents, or tickets.
-- Automatic retries and fallback assignment policies are intentionally not implemented.
+- Automatic retries use a fixed 5-minute interval, as defined in Section 4.7. Fallback assignment policies are not implemented.
 
 ## 6. Acceptance Criteria
 

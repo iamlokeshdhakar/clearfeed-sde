@@ -547,6 +547,7 @@ npm run test:e2e                 # playwright
 Out of scope for this trial, listed so the boundary is explicit rather than implied:
 
 - **Cross-instance coordination.** Both the retry sweep (§8) and the assignment lock (§6) assume a single process, which is what the trial runs. Scaling past one instance needs a `pg_try_advisory_lock` guard around the sweep and a `pg_advisory_xact_lock` in place of `withCompanyLock` (§6) — the same primitive, applied to both paths consistently, rather than solved for one and merely accepted as a limitation for the other.
+- **Schema-level cross-company enforcement.** Cross-company writes are rejected in application code today (§2, §4.2, edge case 9); composite `[companyId, id]` foreign keys would make the same mistake impossible at the database level too. Not built because the assignment service is the only writer for this trial (PRD §5).
 - **Denormalized `lastAssignedAt`.** Only worthwhile once the candidate set is large (§2).
 - **Metrics, tracing, dashboards.** The observability surface for this trial is reason codes (§5) and the persisted `Assignment.explanation` (§4.4) — enough to answer "why" from the code or the data, not enough to page anyone. No metrics pipeline is built.
 - **Staged rollout.** Single local environment via `docker compose` + `prisma migrate dev` (§12); no deployment target, feature flags, or blue-green path — the trial explicitly doesn't call for hosting.

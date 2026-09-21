@@ -57,7 +57,7 @@ Aggregate active tickets and assignment history separately before joining them t
 Persist the explanation with the assignment, including:
 
 - `selected_agent`: ID and name.
-- `eligibility`: an active window (`id`, `day`, `local`, `timezone`), pre-assignment `active_tickets`, and `limit`.
+- `eligibility`: an active window (`id`, `day`, `local` — the window's local time range as `HH:mm`–`HH:mm`, `timezone`), pre-assignment `active_tickets`, and `limit`.
 - `decided_by`: the first ranking key that separates the winner from the runner-up: `FEWEST_ACTIVE_TICKETS`, `NEVER_ASSIGNED`, `LEAST_RECENTLY_ASSIGNED`, or `AGENT_ID_TIEBREAK`. Use `ONLY_ELIGIBLE_AGENT` when there is no runner-up.
 - `runner_up`: ID and active ticket count, when present.
 - `considered`: other agents’ IDs, eligibility, workload where relevant, and rejection reasons (`REMOVED`, `UNAVAILABLE`, or `AT_CAPACITY`).

@@ -103,7 +103,7 @@ enum TicketStatus { OPEN IN_PROGRESS WAITING RESOLVED CLOSED }
 model Assignment {
   id          String   @id @default(cuid())
   companyId   String
-  ticketId    String
+  ticketId    String   @unique             // required for the Ticket.assignment 1:1 back-relation
   agentId     String
   assignedAt  DateTime @default(now())
   explanation Json     // PRD §4.6 payload, persisted so the decision is auditable
@@ -117,7 +117,7 @@ model Assignment {
 
 model PendingAssignment {
   companyId        String
-  ticketId         String
+  ticketId         String   @unique        // required for the Ticket.pending 1:1 back-relation
   reasonCode       String   // NO_AVAILABLE_AGENT | ALL_AVAILABLE_AGENTS_AT_CAPACITY
   firstRequestedAt DateTime @default(now())
   lastAttemptedAt  DateTime @default(now())
@@ -141,6 +141,8 @@ model PendingAssignment {
 **No denormalized `lastAssignedAt` on `Agent`.** It is derived from `MAX(Assignment.assignedAt)` per agent, covered by the `(agentId, assignedAt)` index. One source of truth; a denormalized column could drift from the assignment history it is supposed to summarize. If the candidate set ever grew past a few hundred agents this is the first thing to cache.
 
 **`Assignment` is separate from `Ticket.assigneeId`.** `Ticket` carries the current owner (and is what workload counts read); `Assignment` is the immutable decision record that carries the unique constraint, the explanation, and the fairness history. Keeping them apart means a future manual reassignment can update the ticket without rewriting history.
+
+**`ticketId` carries its own `@unique`, alongside the composite keys.** `Ticket.assignment`/`Ticket.pending` are declared as optional single values, not arrays, which is a promise Prisma can only enforce if the referenced scalar (`ticketId`) is independently unique — `@@unique([companyId, ticketId])` and `@@id([companyId, ticketId])` don't satisfy that on their own, since Prisma doesn't infer single-column uniqueness from a composite one. This adds no new business rule: a ticket belongs to exactly one company by construction, so `ticketId` was already a de facto unique key. The composite keys stay, since the application deliberately queries by `(companyId, ticketId)` as a company-scoping check (§6), not only as an idempotency key.
 
 **Cross-company integrity is an application-level check, not a schema-level one.** Every write path validates `agent.companyId === company.id` (and the equivalent for tickets) before it does anything else (§4.2, edge case 9) — that is what the acceptance criteria and the integration tests actually exercise. A composite `[companyId, id]` foreign key on every relation would make the same mistake impossible at the database level too, which starts to matter once other services write to this data. For this trial the assignment service is the only writer (PRD §5), so that extra structural layer is deferred (§13) rather than built now.
 
@@ -342,12 +344,14 @@ Returns the coverage picture for the Monday-starting week containing `week_start
   "timezone": "Asia/Kolkata",
   "week_start": "2026-09-14T00:00:00+05:30",
   "week_end":   "2026-09-21T00:00:00+05:30",
-  "required":  [ { "day_of_week": 1, "start": "09:00", "end": "18:00" } ],
-  "covered":   [ { "day_of_week": 1, "start": "09:00", "end": "13:00", "agent_ids": ["agt_7"] } ],
-  "gaps":      [ { "day_of_week": 1, "start": "13:00", "end": "18:00", "duration_minutes": 300 } ],
+  "required":  [ { "day_of_week": 1, "start": "2026-09-14T09:00:00+05:30", "end": "2026-09-14T18:00:00+05:30" } ],
+  "covered":   [ { "day_of_week": 1, "start": "2026-09-14T09:00:00+05:30", "end": "2026-09-14T13:00:00+05:30", "agent_ids": ["agt_7"] } ],
+  "gaps":      [ { "day_of_week": 1, "start": "2026-09-14T13:00:00+05:30", "end": "2026-09-14T18:00:00+05:30", "duration_minutes": 300 } ],
   "total_gap_minutes": 300
 }
 ```
+
+`start`/`end` on every interval (`required`, `covered`, `gaps`) are full ISO-8601 instants with offset, not bare `HH:mm` — `day_of_week` is kept alongside purely for display/grouping convenience, but the timestamps are authoritative (§7). This is what lets a fall-back week represent both passes of a repeated local hour distinctly: a New York company requiring Sunday 01:00–02:00 local on 2026-11-01 gets two `required` entries, `2026-11-01T01:00:00-04:00`–`T02:00:00-04:00` (EDT, first pass) and `...T01:00:00-05:00`–`T02:00:00-05:00` (EST, second pass) — identical `day_of_week` and `HH:mm`, distinct real intervals, each checked for coverage independently.
 
 ### `GET /api/companies/:companyId/agents`
 
@@ -371,7 +375,9 @@ Two distinct races have to be closed.
 
 **Race B — capacity overshoot.** Two concurrent calls for *different* tickets of the same company both read agent X at 4 active tickets under a limit of 5, and both pick X. X ends at 6.
 
-The app is single-process for this trial — §8 already accepts that same constraint for the retry worker — so both races are closed with an **in-process lock keyed by `companyId`**, one mechanism and one assumption applied consistently across the assignment path and the retry sweep, rather than a database-level lock built for one path and a documented limitation accepted for the other:
+Both races are closed with an **in-process lock keyed by `companyId`** — correct as long as the app runs single-process, which is this trial's scope (§13 covers the assumption and the multi-instance fix).
+
+The queue-wait timeout and the transaction timeout bound two different phases and must not be merged into one race: the wait timeout governs only how long a caller sits behind a prior holder, and it must never allow `work` to start once it has fired; the queue's own tail must only advance once `work` has actually settled (commit or rollback), not when a caller's own wait gives up on it — otherwise a slow transaction and a timed-out waiter can run concurrently, which is exactly the capacity race this lock exists to close.
 
 ```ts
 // one FIFO queue per company
@@ -379,11 +385,30 @@ const queues = new Map<string, Promise<unknown>>();
 
 export function withCompanyLock<T>(companyId: string, work: () => Promise<T>): Promise<T> {
   const prior = queues.get(companyId) ?? Promise.resolve();
-  const timeout = new Promise<never>((_, reject) =>
+  const priorSettled = prior.then(() => {}, () => {});   // real completion, win or lose
+
+  // Bounds only the WAIT for the previous holder — never `work` itself.
+  const waitTimeout = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new LockTimeoutError()), 2_000));
-  const next = prior.then(() => Promise.race([work(), timeout]));
-  queues.set(companyId, next.catch(() => {}));   // a rejection must never wedge the queue
-  return next;
+
+  // Resolves once it's genuinely this caller's turn; rejects, without ever
+  // touching `work`, if the wait budget expires first.
+  const acquired = Promise.race([priorSettled, waitTimeout]);
+
+  // The one and only invocation of `work`, gated on actually acquiring the turn.
+  const result = acquired.then(() => work());
+
+  // The new queue tail: if we acquired, the lock is held until `work` truly
+  // settles — not until the wait race settles. If we timed out waiting,
+  // `work` never ran, so the tail forwards unchanged to `priorSettled`: the
+  // next caller still waits on the transaction that's actually still running,
+  // never on us.
+  queues.set(companyId, acquired.then(
+    () => result.then(() => {}, () => {}),
+    () => priorSettled,
+  ));
+
+  return result;
 }
 ```
 
@@ -417,27 +442,25 @@ The lock is keyed on `companyId`, not the ticket, because it closes race B: capa
 
 The `UNIQUE (companyId, ticketId)` constraint remains as a **backstop**, not the primary mechanism: if a unique violation (`23505`) ever surfaces — the in-process lock was bypassed, or a future deploy runs more than one instance — the handler re-reads the winning row and returns it as an idempotent replay. Correct behaviour even if the lock is bypassed.
 
-Cost: assignments for one company are serialized within the process. For a support team's ticket volume that is irrelevant, and it buys exact capacity enforcement with no database-specific locking primitive to reason about. Different companies never contend.
-
-**Running more than one instance is out of scope for this trial (§8).** If it became a real requirement, the fix is the same one already called out for the retry worker: swap `withCompanyLock` for `pg_advisory_xact_lock(hashtext(companyId))`, which gives identical per-company serialization across processes. Noted in §13, not built — the same single-instance assumption is made once and applied to both paths, instead of being solved for one and merely accepted as a limitation for the other.
+Cost: assignments for one company are serialized within the process. For a support team's ticket volume that is irrelevant, and it buys exact capacity enforcement with no database-specific locking primitive to reason about. Different companies never contend. Scaling to more than one instance is out of scope for this trial — see §13 for the limitation and its fix.
 
 A pending outcome writes only `PendingAssignment` — no ticket update, no `Assignment` row — so an unsuccessful attempt leaves workload and assignment history untouched, exactly as PRD §4.5 requires.
 
-**A lock or transaction timeout is not a pending outcome.** The lock wait and the surrounding transaction both carry finite timeouts (2s lock, 5s transaction, both shown above). If either fires, the handler rolls back and returns `503 SERVICE_UNAVAILABLE` with `Retry-After: 5` — never `pending`. `pending` means the rules were evaluated and no agent qualified; a timeout means the rules were never fully evaluated.
+**A lock or transaction timeout is not a pending outcome.** The wait and the transaction are sequential, not raced against each other, and each carries its own finite timeout: up to 2s waiting for a prior holder to finish (during which `work` — and therefore the transaction — has not started at all), then up to 5s once the transaction itself is running. If either fires, `503 SERVICE_UNAVAILABLE` with `Retry-After: 5` is returned — never `pending`. `pending` means the rules were evaluated and no agent qualified; a timeout means the rules were never fully evaluated. Because `work` only ever starts after the wait is won, a request that times out waiting is guaranteed to never have touched the database — there is nothing for that request to roll back.
 
 ---
 
 ## 7. Coverage Gap Computation
 
-Gaps are computed against a **concrete reference week** (Monday 00:00 in the company support timezone through the following Monday 00:00), not abstract weekday offsets — coverage is date-specific because the offset between the company's zone and any window's zone can shift week to week (DST doesn't move on the same calendar date everywhere). The week anchor is `DateTime.fromISO(week_start, { zone: company.supportTimezone }).startOf('week')`, using Luxon's default DST resolution as-is (round a nonexistent local time forward, keep the first pass of a repeated one) rather than a bespoke resolver — a company's local midnight landing inside a DST transition is rare enough that a special-case resolver isn't worth building for the trial. The API's `week_start` parameter (§5) picks which week, defaulting to the current one — only the anchor changes; the computation below is identical regardless of which week is requested.
+Gaps are computed against a **concrete reference week** (Monday 00:00 in the company support timezone through the following Monday 00:00), not abstract weekday offsets — coverage is date-specific because the offset between the company's zone and any window's zone can shift week to week (DST doesn't move on the same calendar date everywhere). The week anchors are `weekStart = DateTime.fromISO(week_start, { zone: company.supportTimezone }).startOf('week')` and `weekEnd = weekStart.plus({ weeks: 1 })`. Both use Luxon's default DST resolution as-is (round a nonexistent local time forward, keep the first pass of a repeated one) rather than a bespoke resolver — a company's local midnight landing inside a DST transition is rare enough that a special-case resolver isn't worth building for the trial. `plus({ weeks: 1 })` is calendar-aware, so `weekEnd` always lands on the correct following Monday 00:00 regardless of any DST shift inside the week — but the *elapsed real time* between the two anchors, which is what the grid below actually walks, is then 10,080 minutes only when the week contains no transition. The API's `week_start` parameter (§5) picks which week, defaulting to the current one — only the anchors change; the computation below is identical regardless of which week is requested.
 
-The grid is one slot per minute of the company's local week (7 × 1440 = 10,080 slots). For each slot, resolve its real instant and evaluate every company window against it with **the exact same `isWindowActiveAt` predicate used for assignment** (§3) — not a second implementation of the day/timezone logic — collecting the sorted, deduped IDs of every non-removed agent whose window is active at that instant. A window with only removed agents naturally contributes nothing to any slot.
+The grid walks **real one-minute instants** from `weekStart` to `weekEnd` — `weekStart.plus({ minutes: i })` for `i` in `0 .. weekEnd.diff(weekStart, 'minutes').minutes`, added as an exact duration, not re-resolved as a local wall-clock label. That distinction matters: converting a *local label* like "Sunday 01:15" back to a real instant is ambiguous during a fall-back transition (two real instants share that label) and undefined during a spring-forward one (no real instant has that label). A grid built by enumerating labels first and resolving them second silently collapses a fall-back hour onto whichever pass the DST-resolution rule picks — dropping the other pass's coverage check entirely, along with any gap that exists only in that pass. Walking real instants forward avoids the ambiguity instead of resolving it: each `i` names one distinct instant, so a fall-back week naturally produces two grid entries for the repeated local hour and a spring-forward week naturally produces none for the skipped one — no special-casing required. For each instant, evaluate every company window against it with **the exact same `isWindowActiveAt` predicate used for assignment** (§3) — not a second implementation of the day/timezone logic — collecting the sorted, deduped IDs of every non-removed agent whose window is active at that instant. A window with only removed agents naturally contributes nothing to any slot.
 
 Reusing `isWindowActiveAt` is what makes the cross-timezone case correct by construction: a window authored in `America/New_York` is resolved independently, in its own zone, from that slot's one real instant — including moments where New York's calendar date differs from the company's. A design that instead precomputes a fixed offset between the two zones can get this wrong by exactly one day near a DST transition; this design never computes an offset at all.
 
-Required hours (`RequiredSupportHours`, already authored in the company timezone, same overnight rule as §3) are masked onto the same slot grid. `covered` and `gaps` both come from grouping consecutive slots that share an identical value — grouping by the *set* of covering agents, not just covered/not, so a handoff from one agent's window to another's yields two adjacent intervals with distinct `agent_ids` rather than one interval with ambiguous attribution; a gap is any required slot whose covering set is empty.
+Required hours (`RequiredSupportHours`, already authored in the company timezone, same overnight rule as §3) are evaluated against the same real instants — converting an unambiguous real instant to the company's local wall-clock time to check the required-hours mask is always well-defined, unlike the reverse direction the grid above deliberately avoids. `covered` and `gaps` both come from grouping consecutive instants that share an identical value — grouping by the *set* of covering agents, not just covered/not, so a handoff from one agent's window to another's yields two adjacent intervals with distinct `agent_ids` rather than one interval with ambiguous attribution; a gap is any required instant whose covering set is empty. Each grouped interval's `start`/`end` is emitted as the real ISO-8601 instant, not a bare `HH:mm` (§5): two passes of a fall-back local hour can end up as two separate, adjacent intervals with different coverage, and only an offset-bearing timestamp can tell them apart on the wire — a plain weekday-plus-time pair cannot.
 
-Complexity is `O(10,080 × windows × agents-per-window)` — trivial and independent of how far apart the zones involved are.
+Complexity is `O(minutes-in-the-week × windows × agents-per-window)` — trivial, and independent of how far apart the zones involved are or of the ±60-minute change a DST-transition week makes to the instant count.
 
 ---
 
@@ -449,7 +472,7 @@ A single interval, started once from `instrumentation.ts` (Next.js's server-init
 - For each, call `assignTicket(companyId, ticketId)` — the exact same transactional use-case from §6, not a parallel implementation. That's what guarantees a retry applies the same availability, workload, and fairness rules, and inherits the same idempotency: a ticket assigned between sweeps is short-circuited by the existing-assignment check and its `PendingAssignment` row is deleted, so it's never assigned twice (PRD §4.7).
 - Each call is wrapped individually: one ticket throwing — a transient DB error, a lock timeout — is logged and skipped rather than aborting the sweep. Without that isolation, a single persistently-failing ticket sorted to the front of the batch would block the other 99 behind it every five minutes.
 
-**Known limitation, accepted for this trial:** the worker lives in the application process. Running more than one instance means every instance sweeps, so N instances do N times the work. Correctness still holds — the per-company lock in §6 serializes the concurrent attempts and the existing-assignment check makes the losers no-ops — but the duplicated effort is waste. §13 covers the production fix alongside the same limitation on the assignment lock.
+Multi-instance is out of scope here too (§13) — worth noting for this worker specifically: running N instances wouldn't break correctness, since the §6 lock and existing-assignment check turn the extra sweeps into no-ops, just duplicate the work N times over.
 
 `attemptCount` and `lastAttemptedAt` are updated on every sweep, so the UI can show how long a ticket has been waiting and how many times it has been tried.
 
@@ -463,7 +486,7 @@ Four pages, three scoped to a company. Plain and functional, per the trial brief
 | --- | --- | --- |
 | `/` | Company picker | Lists seeded companies, links into their availability page. No create/switch logic — just a read of seed data, so a reviewer isn't stuck typing a `companyId` into the URL bar. A real multi-tenant product resolves the company from the session instead. |
 | `/companies/:id/availability` | Manage windows | Table grouped by weekday: local times, timezone, agent chips. Overnight windows carry an explicit **"↪ ends Tue"** marker — a lead reading `22:00–06:00` needs to be told which day it lands on. An agent-removed window shows a **⚠ warning badge** and a row tint (PRD §4.1) but stays editable — the point is to prompt correction, not hide the problem. Add/edit is one dialog (weekday multi-select, start/end time, searchable IANA timezone, agent multi-select); the same Zod schema validates client-side for instant feedback and server-side as the real gate. |
-| `/companies/:id/coverage` | Coverage gaps | 7×24 grid (hour cells, minute-resolution data underneath) in the company support timezone, with a banner stating that timezone explicitly. Gaps are also listed below the grid as explicit ranges with durations. |
+| `/companies/:id/coverage` | Coverage gaps | 7×24 grid (hour cells, minute-resolution data underneath) in the company support timezone, with a banner stating that timezone explicitly. Gaps are also listed below the grid as explicit ranges with durations. On the two Sundays a year the company's zone observes a DST transition, the affected hour's cell expands to two stacked cells (one per real pass) instead of silently picking one — consistent with the API's offset-bearing intervals (§7). |
 | `/companies/:id/assignments` | Demo console | Not production — exists so the API is exercisable without curl. **Assign** shows the selected agent, the window that made them available, workload vs. limit, and the §4.4 explanation as prose; a pending result shows the reason and per-agent breakdown. A **Run retry sweep now** button hits `POST /api/internal/retry-pending` so the retry path is demonstrable in seconds. |
 
 **Stale response handling.** The three company-scoped pages key their fetches by `companyId` (and, on coverage, the selected week); a response tagged for a selection the lead has since navigated away from is discarded rather than rendered. Without this, a slow response for company A landing after the lead switches to company B would briefly render A's data under B's name.
@@ -499,7 +522,9 @@ Four pages, three scoped to a company. Plain and functional, per the trial brief
 | 23 | Window spans the week boundary (Sun 22:00 – Mon 06:00) | Evaluation wraps Sunday→Monday via `(dayOfWeek % 7) + 1`; coverage wraps modulo 10080. |
 | 24 | Lock or transaction timeout during assignment | `503 SERVICE_UNAVAILABLE` with `Retry-After: 5`; never reported as `pending` (§6). |
 | 25 | Retry sweep hits a ticket whose evaluation throws | Error logged, that ticket skipped this pass; the rest of the batch still runs (§8). |
-| 26 | Coverage requested for a past or future week | Same computation with a different `week_start`; anchor resolved per §7, including across a DST week boundary. |
+| 26 | Coverage requested for a past or future week | Same computation with a different `week_start`; anchors resolved per §7, including across a DST week boundary. |
+| 27 | Fall-back week, required hours or an agent window falling inside the repeated local hour | Both real passes are walked and evaluated independently (§7); a gap present in only one pass is reported, never hidden by the other. |
+| 28 | Spring-forward week | The grid walks the true, shorter elapsed real time for that week; the skipped local hour contributes no slot in either direction (§7). |
 
 ---
 
@@ -509,11 +534,13 @@ Given the trial's time budget, unit tests come first (cheap, no infra, cover the
 
 ### Unit (fast, no DB, injected `now`)
 
-Covers the pure logic in isolation: availability window evaluation (boundary inclusivity, overnight and week-boundary wraparound, cross-timezone evaluation, DST spring-forward/fall-back), fairness ranking (each tie-break rule in order, plus the empty-eligible-set case), and coverage gap computation (partial coverage, removed-agent windows, multi-agent handoffs, and week-anchoring including DST edge cases).
+Covers the pure logic in isolation: availability window evaluation (boundary inclusivity, overnight and week-boundary wraparound, cross-timezone evaluation, DST spring-forward/fall-back), fairness ranking (each tie-break rule in order, plus the empty-eligible-set case), and coverage gap computation (partial coverage, removed-agent windows, multi-agent handoffs, and week-anchoring including DST edge cases — specifically a mixed-zone fall-back week where an agent's window covers only one of the two real passes of a repeated required-hours label, asserting the gap in the uncovered pass is reported and not hidden by the covered one, and a spring-forward week, asserting the grid walks one fewer real hour rather than fabricating a slot for the skipped one).
 
 ### Integration (real Postgres, per-test transaction rollback)
 
 Covers the assignment API's actual guarantees end to end: the happy path and its explanation payload; idempotency on repeat calls; both pending reasons (no availability vs. at capacity) with correct precedence; the retry sweep resolving a pending ticket without double-assigning one already resolved; concurrent calls racing for one ticket and for shared capacity (verifying the in-process lock, §6); validation of every rule in §5; stale-agent exclusion; cross-company isolation; and a forced lock/transaction timeout returning `503` rather than `pending`.
+
+A dedicated concurrency regression, not just a status-code assertion: hold one request's `work` open with an injected delay (e.g. 2.4s, inside the 5s transaction budget) and fire a second request for the same company behind it. Assert the second request's `work` is never invoked until the first's transaction has actually committed or rolled back — not merely that both calls eventually return — and, for a caller whose wait exceeds the 2s budget and gets `503`, assert no `Assignment`/`Ticket` row is ever written for that caller's ticket afterward. This is what catches a lock implementation that races the wait timeout against `work` itself instead of gating `work` on actually acquiring the turn (§6).
 
 ### End-to-end — Playwright, one flow
 
@@ -549,6 +576,7 @@ Out of scope for this trial, listed so the boundary is explicit rather than impl
 - **Cross-instance coordination.** Both the retry sweep (§8) and the assignment lock (§6) assume a single process, which is what the trial runs. Scaling past one instance needs a `pg_try_advisory_lock` guard around the sweep and a `pg_advisory_xact_lock` in place of `withCompanyLock` (§6) — the same primitive, applied to both paths consistently, rather than solved for one and merely accepted as a limitation for the other.
 - **Schema-level cross-company enforcement.** Cross-company writes are rejected in application code today (§2, §4.2, edge case 9); composite `[companyId, id]` foreign keys would make the same mistake impossible at the database level too. Not built because the assignment service is the only writer for this trial (PRD §5).
 - **Denormalized `lastAssignedAt`.** Only worthwhile once the candidate set is large (§2).
+- **Interval/sweep-line coverage computation.** §7 walks every real minute of the week (~10,080, ±60 across a DST transition) rather than computing each window's real occurrences as intervals and merging them. The interval approach is asymptotically cheaper — O(events) instead of O(minutes) — but at this trial's scale both run in milliseconds, and interval math (overnight wraparound, weekly recurrence, and the same DST-fold expansion §7 already has to get right, just relocated to per-window interval construction) is meaningfully more code and more ways to reintroduce the exact class of bug §7 was just fixed for. Worth revisiting only if the number of companies/windows/agents grows enough that per-minute evaluation stops being trivial.
 - **Metrics, tracing, dashboards.** The observability surface for this trial is reason codes (§5) and the persisted `Assignment.explanation` (§4.4) — enough to answer "why" from the code or the data, not enough to page anyone. No metrics pipeline is built.
 - **Staged rollout.** Single local environment via `docker compose` + `prisma migrate dev` (§12); no deployment target, feature flags, or blue-green path — the trial explicitly doesn't call for hosting.
 - **Holiday calendars, one-off overrides, fallback owners, escalation.** Excluded by the PRD.

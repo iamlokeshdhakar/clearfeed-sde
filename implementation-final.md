@@ -11,7 +11,7 @@ The [PRD](prd-ticket-assignment-automation.md) defines product scope and require
 `POST /api/assignments` accepts `company_id` and `ticket_id`. Validate the input, acquire the company queue, and run one transaction:
 
 1. Look up the saved assignment by company and ticket. If found, return it as an idempotent replay and remove any leftover pending row.
-2. Otherwise, check that the company and ticket exist, the ticket belongs to the company, and its status is non-terminal.
+2. Otherwise, check that the company and ticket exist, the ticket belongs to the company, and its status is non-terminal. If it is terminal with no saved assignment, delete any existing pending row for it, commit, and return `409 TICKET_TERMINAL`; a terminal ticket is never retried again.
 3. Load company settings, agents, windows, active ticket counts, and latest assignment times. Aggregate by agent rather than querying each agent separately. Capture one decision time after acquiring the queue.
 4. Evaluate and rank candidates. On success, update the ticket owner/time, insert the assignment and explanation, and delete the pending row. Use the same decision timestamp for `Ticket.assignedAt`, `Assignment.assignedAt`, and the response. If no agent qualifies, upsert only the pending row.
 5. Commit before returning; release the queue after commit or rollback.
@@ -23,8 +23,8 @@ The [PRD](prd-ticket-assignment-automation.md) defines product scope and require
 Implement PRD §4.1 with the shared predicate below. Weekdays are Monday = 1 through Sunday = 7; times are integer minutes from midnight. Validation rejects equal start/end values before this function runs.
 
 ```ts
-function isWindowActiveAt(w: WindowSpec, now: DateTime): boolean {
-  const local = now.setZone(w.timezone);
+function isWindowActiveAt(w: WindowSpec, at: DateTime): boolean {
+  const local = at.setZone(w.timezone);
   const minute = local.hour * 60 + local.minute;
   if (w.startMinute < w.endMinute) {
     return local.weekday === w.dayOfWeek
@@ -66,7 +66,7 @@ Persist the explanation with the assignment, including:
 
 ### One queue per company
 
-API calls and retries use the same `assignTicket` service and shared queue registry. A FIFO queue keyed by `companyId` serializes the whole transaction so each decision sees the previous committed workload. Different companies use separate queues. Locking only the ticket would not protect capacity shared across tickets.
+This is an in-process, synchronous mutex per company, not an asynchronous job queue: nothing is enqueued for later background processing. API calls and retries use the same `assignTicket` service and shared queue registry. The caller — the HTTP request handler itself, or the retry worker processing one ticket — waits in a FIFO line keyed by `companyId` for its turn, then runs the whole transaction synchronously within that same call, and only returns (the HTTP response, or control to the worker) after the transaction commits or rolls back and the lock is released. This serializes each company's decisions so every transaction sees the previous committed workload. Different companies use separate locks and never wait on each other. Locking only the ticket would not protect capacity shared across tickets.
 
 Implement `withCompanyLock` with these guarantees:
 
@@ -85,13 +85,17 @@ On an assignment uniqueness conflict, let the losing transaction roll back, then
 
 Lock and transaction timeouts return `503 SERVICE_UNAVAILABLE` with `Retry-After: 5`. Database failures remain errors, never pending results. If a response is lost after commit, repeating the request returns the stored assignment.
 
+A `503` does not write a pending row, so it is not picked up by the retry worker in section 4; unlike a pending outcome, it does not self-heal. The caller is expected to retry using `Retry-After`.
+
 All assignment writers must use the queue in the same process. Multi-instance operation is outside this trial; see section 11.
 
 ## 4. Pending tickets and retries
 
 Upsert one `PendingAssignment` row when evaluation finds no eligible agent. Use `NO_AVAILABLE_AGENT` when no valid agent is available; otherwise use `ALL_AVAILABLE_AGENTS_AT_CAPACITY`. Preserve `firstRequestedAt`, update the reason and `lastAttemptedAt`, and increment `attemptCount` on each completed pending evaluation. New rows start at one attempt.
 
-Register the five-minute interval once from `instrumentation.ts`, including during development reloads. Each scheduled sweep reads up to 100 due rows, oldest `lastAttemptedAt` first, and calls `assignTicket` for each. Catch and log each ticket’s error so the remaining batch still runs. Successful assignments and replays remove their pending rows through that service.
+Register the five-minute interval once from `instrumentation.ts`, including during development reloads. Each scheduled sweep reads up to 100 due rows, oldest `lastAttemptedAt` first, and calls `assignTicket` for each. Successful assignments and replays remove their pending rows through that service.
+
+Catch each ticket’s error so the remaining batch still runs, and make sure a failing row cannot occupy the oldest position forever. A `TICKET_TERMINAL` error already removed the pending row inside `assignTicket` (section 1), so the worker only logs it. Any other error leaves the row pending — `assignTicket` did not complete an evaluation, so it never touched `lastAttemptedAt` or `attemptCount` itself — so the worker separately sets that row’s `lastAttemptedAt` to the sweep time and increments `attemptCount` before logging. This backs a repeatedly failing row off behind the next 5-minute window instead of leaving it as the oldest due row, so later-due, still-retryable tickets are never crowded out of the oldest-100 selection indefinitely.
 
 A row is due when `lastAttemptedAt + 5 minutes <= sweep time`. Return that same threshold as `next_retry_at`. It is an eligibility time, not a promise of completion: the next interval and the batch limit can delay processing. Pending rows survive restarts.
 
@@ -248,7 +252,7 @@ Show loading, empty, and request-error states on each page. Keep form input when
 | --- | --- |
 | Ticket already has an assignment | Return the saved decision with `idempotent_replay: true`, even if now terminal. No workload or history change. |
 | Ticket belongs to another company | `422 TICKET_COMPANY_MISMATCH`; no assignment is made. |
-| Ticket is `RESOLVED` or `CLOSED`, with no saved assignment | `409 TICKET_TERMINAL`. |
+| Ticket is `RESOLVED` or `CLOSED`, with no saved assignment | `409 TICKET_TERMINAL`; delete any pending row for it so it is not retried again. |
 | No agent is available | Pending with `NO_AVAILABLE_AGENT`; only the pending row is written. |
 | Available agents all meet or exceed the limit | Pending with `ALL_AVAILABLE_AGENTS_AT_CAPACITY`. |
 | Company limit is zero | Valid configuration; an unassigned, non-terminal ticket stays pending. Reason depends on whether any agent is available. |
@@ -266,15 +270,17 @@ These cases assume the single-process queue in section 3.
 | Caller exceeds the 2-second queue wait | `503 SERVICE_UNAVAILABLE` with `Retry-After: 5`. Its work never starts; the current holder keeps the queue. |
 | Running transaction exceeds its 5-second budget | Roll back and return `503 SERVICE_UNAVAILABLE` with `Retry-After: 5`. Hold the queue until rollback finishes. |
 | Retry finds a ticket already assigned | Replay the stored decision and delete any leftover pending row; do not assign again. |
-| One retry throws | Log the error and skip that ticket for this sweep; continue with the remaining batch. |
+| One retry throws (`TICKET_TERMINAL`) | Delete the pending row inside `assignTicket`, log, and continue with the remaining batch; the row is never selected again. |
+| One retry throws (any other error) | Log the error, set that row’s `lastAttemptedAt` to the sweep time, and increment `attemptCount`; continue with the remaining batch. This backs the row off behind the next 5-minute window instead of leaving it as the oldest due row. |
+| 100 pending rows keep failing every attempt (terminal, or erroring) | Terminal rows are deleted and never reselected; erroring rows back off behind the next window. A later-due, genuinely eligible ticket is retried within a bounded number of sweeps rather than being crowded out indefinitely. |
 
 ### Timezones and coverage
 
 | Case | Expected behavior |
 | --- | --- |
 | Window timezone differs from company timezone | Evaluate availability in the window’s zone; display coverage in the company’s zone. |
-| Window covers only a skipped spring-forward hour | Inactive that day because those local times never occur. |
-| Window covers a repeated fall-back hour | Active during both real passes of that local hour. |
+| Window covers only a skipped spring-forward hour (e.g. a 02:00–02:30 window on the day clocks jump 02:00 → 03:00) | Inactive that day because those local times never occur; the window works normally on every other day. |
+| Window covers a repeated fall-back hour (e.g. a 01:00–01:30 window on the day clocks go 02:00 → 01:00) | Active during both real passes of that local hour. |
 | Required hour repeats, but another-zone window covers only one pass | Evaluate both passes separately and report the uncovered pass as a gap. Offset-bearing timestamps distinguish them. |
 | Reference week includes spring-forward | Walk the shorter elapsed week; create no slots or gaps for nonexistent local times. |
 | Coverage requested for a past or future week | Resolve that week’s boundaries and timezone offsets, then run the same calculation. |
@@ -286,11 +292,12 @@ Build in this order: schema and seed data → pure availability/ranking/coverage
 | Test layer | Required coverage |
 | --- | --- |
 | Unit | Start/end boundaries; overnight and Sunday-to-Monday windows; overlapping memberships; removed agents; different timezones; DST skipped and repeated hours; all ranking rules and explanations; empty candidates; partial coverage and agent handoffs; past/future reference weeks. |
-| Integration with real PostgreSQL | Assignment and explanation; replay without extra writes; both pending reasons and zero capacity; pending upserts; workload counts with multiple active tickets and history rows; all validation rules; company isolation; stale-agent exclusion; scheduled retry due-time boundaries, immediate manual retry, and success/replay/error isolation; transactional rollback; same-ticket and shared-capacity concurrency; queue/transaction timeout responses. |
+| Integration with real PostgreSQL | Assignment and explanation; replay without extra writes; both pending reasons and zero capacity; pending upserts; workload counts with multiple active tickets and history rows; all validation rules; company isolation; stale-agent exclusion; scheduled retry due-time boundaries, immediate manual retry, and success/replay/error isolation; terminal-retry row deletion and non-terminal-failure back-off; transactional rollback; same-ticket and shared-capacity concurrency; queue/transaction timeout responses. |
 | Playwright | Create an overnight window → see it and its marker → confirm a coverage gap shrinks → assign a ticket in the demo console and read the explanation. |
 
-Two regressions are essential:
+Three regressions are essential:
 
+- **Retry progress under poison rows:** seed 100 pending rows that fail every retry — a mix of now-terminal tickets (no saved assignment) and rows whose evaluation throws — plus one later pending ticket that is genuinely eligible. Run consecutive scheduled sweeps and assert the eligible ticket is assigned within a bounded number of sweeps: terminal rows must be deleted and never reselected, and erroring rows must back off behind the next window rather than permanently occupying the oldest-100 batch.
 - **Slow transaction and waiting requests:** hold one transaction for about 2.4 seconds, within its 5-second execution budget. Verify no second same-company transaction enters before the first commits or rolls back. A caller that exceeds the 2-second wait receives 503 and must never start work or write its ticket afterward. A later caller must still wait behind the actual holder.
 - **Coverage across DST:** in a mixed-timezone fall-back week, cover only one pass of a repeated required hour and assert the other pass remains a gap. In a spring-forward week, assert that the skipped hour creates no slot. Compare real instants and elapsed durations.
 
@@ -315,5 +322,4 @@ Product exclusions remain in PRD §2 and assumptions in PRD §5. Implementation 
 
 - **Single process:** the company queue cannot protect capacity across application instances. Before scaling, use a database transaction-level lock per company with bounded acquisition and coordinate retry sweeps across instances.
 - **Schedule edits:** concurrent edits are last-write-wins; changes across several day-rows are not atomic. Multi-day creation is atomic.
-- **Retry progress:** terminal pending tickets return 409 and remain queued. Failed retries leave `lastAttemptedAt` unchanged. If enough such rows occupy the oldest 100 positions, later due tickets can be delayed indefinitely. The proposed correction below is separate from the current behavior.
 - **Scale and operations:** assignment-time caching, interval-based coverage, and metrics/tracing are deferred. The trial uses saved explanations, reason codes, and worker error logs, and runs locally without a deployment stage.

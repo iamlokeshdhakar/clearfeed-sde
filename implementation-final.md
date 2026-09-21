@@ -58,9 +58,9 @@ Persist the explanation with the assignment, including:
 
 - `selected_agent`: ID and name.
 - `eligibility`: an active window (`id`, `day`, `local` — the window's local time range as `HH:mm`–`HH:mm`, `timezone`), pre-assignment `active_tickets`, and `limit`.
-- `decided_by`: the first ranking key that separates the winner from the runner-up: `FEWEST_ACTIVE_TICKETS`, `NEVER_ASSIGNED`, `LEAST_RECENTLY_ASSIGNED`, or `AGENT_ID_TIEBREAK`. Use `ONLY_ELIGIBLE_AGENT` when there is no runner-up.
-- `runner_up`: ID and active ticket count, when present.
-- `considered`: other agents’ IDs, eligibility, workload where relevant, and rejection reasons (`REMOVED`, `UNAVAILABLE`, or `AT_CAPACITY`).
+- `decided_by`: the ranking key that separated the winner from the next-best candidate: `FEWEST_ACTIVE_TICKETS`, `NEVER_ASSIGNED`, `LEAST_RECENTLY_ASSIGNED`, or `AGENT_ID_TIEBREAK`. Use `ONLY_ELIGIBLE_AGENT` when there was no other candidate.
+
+Do not persist a runner-up or a full per-agent candidate trace — the PRD (§4.6) only requires who was selected, why they were eligible, and which rule decided it. A pending result exposes a compact reason and count (below), not a rejection breakdown for every agent. Add a fuller audit payload later only if a real consumer needs it.
 
 ## 3. Concurrency and failure handling
 
@@ -99,7 +99,7 @@ Catch each ticket’s error so the remaining batch still runs, and make sure a f
 
 A row is due when `lastAttemptedAt + 5 minutes <= sweep time`. Return that same threshold as `next_retry_at`. It is an eligibility time, not a promise of completion: the next interval and the batch limit can delay processing. Pending rows survive restarts.
 
-The manual demo sweep uses the same batch processor and assignment service but skips the age filter, so “Run retry sweep now” can demonstrate a retry without waiting five minutes.
+There is no manual-trigger route or console for this; integration tests invoke the batch processor directly (bypassing the age filter) to exercise a retry without waiting five minutes.
 
 ## 5. Managing schedules and computing coverage
 
@@ -141,23 +141,23 @@ Use the following Prisma models:
 | `Company` | `id`, `name`, `supportTimezone`, `maxActiveTicketsPerAgent`. |
 | `Agent` | `id`, `companyId`, `name`, `email`, nullable `removedAt`. |
 | `AvailabilityWindow` | `id`, `companyId`, `dayOfWeek`, `startMinute`, `endMinute`, `timezone`, `createdAt`, `updatedAt`. |
-| `AvailabilityWindowAgent` | `windowId`, `companyId`, `agentId`; primary key `(windowId, agentId)`. |
+| `AvailabilityWindowAgent` | `windowId`, `agentId`; primary key `(windowId, agentId)`. |
 | `RequiredSupportHours` | `id`, `companyId`, `dayOfWeek`, `startMinute`, `endMinute`; uses the company timezone and the same overnight rules. |
 | `Ticket` | `id`, `companyId`, `status`, nullable `assigneeId` and `assignedAt`. |
-| `Assignment` | `id`, `companyId`, `ticketId`, `agentId`, `assignedAt`, JSON `explanation`. |
-| `PendingAssignment` | `companyId`, `ticketId`, `reasonCode`, `firstRequestedAt`, `lastAttemptedAt`, `attemptCount`; primary key `(companyId, ticketId)`. |
+| `Assignment` | `id`, `ticketId`, `agentId`, `assignedAt`, JSON `explanation`. |
+| `PendingAssignment` | `ticketId`, `reasonCode`, `firstRequestedAt`, `lastAttemptedAt`, `attemptCount`; primary key `ticketId`. |
 
 **Types/defaults:** string IDs with CUID defaults on standalone primary keys; integer weekdays, minutes (0–1439), limits, and counts; `DateTime` timestamps. Tickets default to `OPEN`, attempts to 1, and creation/assignment/pending timestamps to now. Maintain window `updatedAt` on edits.
 
 **Relations:** company foreign keys on agents, windows, required hours, and tickets; window/agent foreign keys on memberships; optional assignee foreign key on tickets; ticket/agent foreign keys on assignments; ticket foreign key on pending rows. Window deletion cascades memberships.
 
-Both `Assignment.ticketId` and `PendingAssignment.ticketId` are independently unique for Prisma’s optional one-to-one ticket relations. Also keep `Assignment` unique on `(companyId, ticketId)` and the pending composite primary key for company-scoped lookup.
+`Assignment.ticketId` is unique for Prisma’s optional one-to-one ticket relation; `PendingAssignment` uses `ticketId` itself as its primary key, so no composite key is needed on either.
 
-**Indexes.** Keep `Agent(companyId, removedAt)`, `AvailabilityWindow(companyId, dayOfWeek)`, `AvailabilityWindowAgent(companyId, agentId)`, `RequiredSupportHours(companyId)`, `Ticket(assigneeId, status)`, `Ticket(companyId, status)`, `Assignment(agentId, assignedAt)`, and `PendingAssignment(lastAttemptedAt)`.
+Memberships, assignments, and pending rows do not store their own `companyId`. Derive company ownership through the parent relation instead — membership → window → company, and assignment/pending → ticket → company — rather than a denormalized copy the app has to keep in sync on every write. Denormalize later only if a measured query needs it.
+
+**Indexes.** Keep `Agent(companyId, removedAt)`, `AvailabilityWindow(companyId, dayOfWeek)`, `AvailabilityWindowAgent(agentId)`, `RequiredSupportHours(companyId)`, `Ticket(assigneeId, status)`, `Ticket(companyId, status)`, `Assignment(agentId, assignedAt)`, and `PendingAssignment(lastAttemptedAt)`.
 
 `Ticket.assigneeId` supplies workload counts. `Assignment` stores the immutable automatic decision and fairness history. Seeded owners and decisions must agree.
-
-Validate company ownership on every write; the company IDs on memberships, assignments, and pending rows have no composite foreign-key enforcement.
 
 ## 7. API contracts
 
@@ -187,7 +187,7 @@ Request: `POST /api/assignments` with `{ "company_id": "cmp_1", "ticket_id": "tk
   "reason": "ALL_AVAILABLE_AGENTS_AT_CAPACITY",
   "message": "3 agents are available, all at the 5-ticket limit.",
   "next_retry_at": "2026-09-20T09:19:03.118Z",
-  "considered": [ /* per-agent rejection details */ ]
+  "available_agent_count": 3
 }
 ```
 
@@ -212,22 +212,20 @@ All errors use `{ "error": { "code": "...", "message": "...", "details": [] } }`
 | `DELETE /api/availability-windows/:windowId` | Deletes the window and its memberships. |
 | `GET /api/companies/:companyId/coverage?week_start=YYYY-MM-DD` | Coverage intervals from section 5; optional date selects its containing week. |
 | `GET /api/companies/:companyId/agents` | Agent details, `active_ticket_count`, `is_available_now`, and `removed_at`. |
-| `POST /api/internal/retry-pending` | Runs the manual sweep from section 4 and returns counts, e.g. `{ "swept": 4, "assigned": 1, "still_pending": 3 }`. |
 
 ## 8. Main UI flow
 
-Select a seeded company → configure availability → review coverage gaps → use the assignment console to exercise the API.
+Select a seeded company → configure availability → review coverage gaps. The brief scopes the UI to configuring and reviewing team availability (PRD §7); the assignment API is exercised directly (curl example in section 10), not through a second, UI-only console.
 
 | Page | Implementation |
 | --- | --- |
 | `/` | Pick a seeded company without entering an ID. |
 | `/companies/:id/availability` | Weekday-grouped table and create/edit dialog with day/agent selectors, time inputs, and searchable timezone. Edit or delete one day-row at a time; deleting calls `DELETE /api/availability-windows/:windowId` and removes it from the table. Show overnight end-day labels, stale-agent warnings, and inline validation errors. |
 | `/companies/:id/coverage` | Week selector, labeled company timezone, hourly grid backed by minute data, and gap list with durations. Show separate passes of repeated hours and mark skipped hours as nonexistent. |
-| `/companies/:id/assignments` | Demo console showing assignment, qualifying window, workload/limit, explanation, or pending reasons. “Run retry sweep now” calls the demo endpoint. |
 
 Key requests by company and, for coverage, selected week. Discard responses for a selection the user has left so old data cannot appear under a new company or week.
 
-Show loading, empty, and request-error states on each page. Keep form input when a save fails and disable repeat submission while it is running. Refresh the window list and coverage after a successful schedule change. In the console, show a 503 as a retryable request failure, separate from a valid pending result.
+Show loading, empty, and request-error states on each page. Keep form input when a save fails and disable repeat submission while it is running. Refresh the window list and coverage after a successful schedule change.
 
 ## 9. Edge cases
 
@@ -292,8 +290,8 @@ Build in this order: schema and seed data → pure availability/ranking/coverage
 | Test layer | Required coverage |
 | --- | --- |
 | Unit | Start/end boundaries; overnight and Sunday-to-Monday windows; overlapping memberships; removed agents; different timezones; DST skipped and repeated hours; all ranking rules and explanations; empty candidates; partial coverage and agent handoffs; past/future reference weeks. |
-| Integration with real PostgreSQL | Assignment and explanation; replay without extra writes; both pending reasons and zero capacity; pending upserts; workload counts with multiple active tickets and history rows; all validation rules; company isolation; stale-agent exclusion; scheduled retry due-time boundaries, immediate manual retry, and success/replay/error isolation; terminal-retry row deletion and non-terminal-failure back-off; transactional rollback; same-ticket and shared-capacity concurrency; queue/transaction timeout responses. |
-| Playwright | Create an overnight window → see it and its marker → confirm a coverage gap shrinks → assign a ticket in the demo console and read the explanation. |
+| Integration with real PostgreSQL | Assignment and explanation; replay without extra writes; both pending reasons and zero capacity; pending upserts; workload counts with multiple active tickets and history rows; all validation rules; company isolation; stale-agent exclusion; scheduled retry due-time boundaries, the batch processor invoked directly (bypassing the age filter), and success/replay/error isolation; terminal-retry row deletion and non-terminal-failure back-off; transactional rollback; same-ticket and shared-capacity concurrency; queue/transaction timeout responses. |
+| Playwright | Create an overnight window → see it and its marker → confirm a coverage gap shrinks. |
 
 Three regressions are essential:
 
@@ -314,6 +312,11 @@ npm run dev                  # UI, API, and retry worker on port 3000
 
 npm test                     # Vitest unit and integration tests
 npm run test:e2e              # Playwright
+
+# Exercise the assignment API directly, e.g. against a seeded ticket:
+curl -X POST http://localhost:3000/api/assignments \
+  -H "Content-Type: application/json" \
+  -d '{"company_id": "cmp_1", "ticket_id": "tkt_42"}'
 ```
 
 ## 11. Trial boundaries and known limitations

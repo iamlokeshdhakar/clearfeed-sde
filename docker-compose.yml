@@ -3,16 +3,16 @@ services:
     image: postgres:16
     restart: unless-stopped
     environment:
-      POSTGRES_USER: cleatfeed
-      POSTGRES_PASSWORD: cleatfeed
-      POSTGRES_DB: cleatfeed
+      POSTGRES_USER: clearfeed
+      POSTGRES_PASSWORD: clearfeed
+      POSTGRES_DB: clearfeed
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cleatfeed"]
+      test: ["CMD-SHELL", "pg_isready -U clearfeed"]
       interval: 5s
       timeout: 5s
       retries: 10

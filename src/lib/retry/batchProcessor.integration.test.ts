@@ -78,6 +78,7 @@ describe("runRetrySweep", () => {
     const bypassed = await runRetrySweep({
       now: MONDAY_NOON,
       bypassAgeFilter: true,
+      decisionNowForTest: () => MONDAY_NOON,
     });
     expect(bypassed.processed).toBe(1);
     expect(bypassed.assigned).toBe(1);
@@ -95,7 +96,10 @@ describe("runRetrySweep", () => {
       attemptCount: 3,
     });
 
-    const result = await runRetrySweep({ now: MONDAY_NOON });
+    const result = await runRetrySweep({
+      now: MONDAY_NOON,
+      decisionNowForTest: () => MONDAY_NOON,
+    });
     expect(result.assigned).toBe(1);
 
     const updatedTicket = await prisma.ticket.findUniqueOrThrow({
@@ -209,11 +213,19 @@ describe("runRetrySweep", () => {
 
     const holder = withCompanyLock(poisonCompany.id, () => delay(6000));
 
-    const sweep1 = await runRetrySweep({ bypassAgeFilter: true, limit: 3 });
+    const sweep1 = await runRetrySweep({
+      bypassAgeFilter: true,
+      limit: 3,
+      decisionNowForTest: () => MONDAY_NOON,
+    });
     expect(sweep1.terminalRemoved).toBe(2);
     expect(sweep1.errored).toBe(1);
 
-    await runRetrySweep({ bypassAgeFilter: true, limit: 3 });
+    await runRetrySweep({
+      bypassAgeFilter: true,
+      limit: 3,
+      decisionNowForTest: () => MONDAY_NOON,
+    });
 
     const updated = await prisma.ticket.findUniqueOrThrow({
       where: { id: eligibleTicket.id },
@@ -222,6 +234,64 @@ describe("runRetrySweep", () => {
 
     await holder;
   }, 15000);
+
+  it("evaluates each row's own decision time instead of stamping the whole batch with the sweep-start time", async () => {
+    // Two companies, two shifts that don't overlap: agentEarly only covers
+    // 11:30-12:15, agentLate only covers 12:15-13:00. A row processed at
+    // 12:00 must go to agentEarly; the same row processed at 12:30 must go
+    // to agentLate instead - the two outcomes are mutually exclusive, so
+    // this only passes if each row really gets its own decision time.
+    const earlyCompany = await makeCompany();
+    const agentEarly = await createAgent(earlyCompany.id);
+    await createWindow(earlyCompany.id, [agentEarly.id], {
+      dayOfWeek: 1,
+      startMinute: 11 * 60 + 30,
+      endMinute: 12 * 60 + 15,
+      timezone: "UTC",
+    });
+
+    const lateCompany = await makeCompany();
+    const agentLate = await createAgent(lateCompany.id);
+    await createWindow(lateCompany.id, [agentLate.id], {
+      dayOfWeek: 1,
+      startMinute: 12 * 60 + 15,
+      endMinute: 13 * 60,
+      timezone: "UTC",
+    });
+
+    const earlyTicket = await createTicket(earlyCompany.id);
+    const lateTicket = await createTicket(lateCompany.id);
+    // lastAttemptedAt order decides processing order: earlyTicket first.
+    await createPendingRow(earlyTicket.id, {
+      lastAttemptedAt: new Date(MONDAY_NOON.minus({ minutes: 5 }).toMillis()),
+    });
+    await createPendingRow(lateTicket.id, {
+      lastAttemptedAt: new Date(MONDAY_NOON.minus({ minutes: 4 }).toMillis()),
+    });
+
+    // Simulates the batch taking 30 minutes to reach the second row (e.g.
+    // company-lock contention): the first row is decided at 12:00, the
+    // second at 12:30, well past the 12:15 shift change.
+    let calls = 0;
+    const decisionTimes = [MONDAY_NOON, MONDAY_NOON.plus({ minutes: 30 })];
+    const decisionNowForTest = () => decisionTimes[calls++];
+
+    const result = await runRetrySweep({
+      bypassAgeFilter: true,
+      decisionNowForTest,
+    });
+    expect(result.assigned).toBe(2);
+
+    const updatedEarly = await prisma.ticket.findUniqueOrThrow({
+      where: { id: earlyTicket.id },
+    });
+    expect(updatedEarly.assigneeId).toBe(agentEarly.id);
+
+    const updatedLate = await prisma.ticket.findUniqueOrThrow({
+      where: { id: lateTicket.id },
+    });
+    expect(updatedLate.assigneeId).toBe(agentLate.id);
+  });
 
   it("processes oldest lastAttemptedAt first, up to the batch limit", async () => {
     const company = await makeCompany();

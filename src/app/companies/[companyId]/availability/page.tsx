@@ -38,6 +38,10 @@ export default function AvailabilityPage({
   const [windows, setWindows] = useState<AvailabilityWindowDTO[] | null>(null);
   const [agents, setAgents] = useState<AgentDTO[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Tracked independently of windows/agents: if the initial request fails,
+  // those stay null forever, and deriving `loading` from them would leave
+  // the page stuck on skeletons with no way to recover.
+  const [loading, setLoading] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingWindow, setEditingWindow] =
     useState<AvailabilityWindowDTO | null>(null);
@@ -46,6 +50,7 @@ export default function AvailabilityPage({
   const load = useCallback(
     async (signal?: AbortSignal) => {
       setError(null);
+      setLoading(true);
       try {
         const [windowsRes, agentsRes] = await Promise.all([
           apiRequest<{ windows: AvailabilityWindowDTO[] }>(
@@ -67,6 +72,8 @@ export default function AvailabilityPage({
             ? err.message
             : "Failed to load availability.",
         );
+      } finally {
+        if (!signal?.aborted) setLoading(false);
       }
     },
     [companyId],
@@ -101,7 +108,6 @@ export default function AvailabilityPage({
 
   const activeAgents =
     agents?.filter((agent) => agent.removed_at === null) ?? [];
-  const loading = windows === null || agents === null;
 
   const staleWindowsCount = windows
     ? windows.filter((w) => w.agents.some((a) => a.is_stale)).length
@@ -141,7 +147,7 @@ export default function AvailabilityPage({
       </div>
 
       {/* Summary Stat Cards */}
-      {!loading && (
+      {!loading && windows && agents && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <div className="flex items-center gap-3 rounded-xl border border-border/80 bg-card p-4 shadow-xs">
             <div className="flex size-10 items-center justify-center rounded-lg bg-primary/10 text-primary">
@@ -190,9 +196,20 @@ export default function AvailabilityPage({
       )}
 
       {error && (
-        <div className="flex items-center gap-2 rounded-xl bg-destructive/10 border border-destructive/20 p-3.5 text-sm text-destructive font-medium">
-          <TriangleAlertIcon className="size-4 shrink-0" />
-          <span>{error}</span>
+        <div className="flex items-center justify-between gap-3 rounded-xl bg-destructive/10 border border-destructive/20 p-3.5 text-sm text-destructive font-medium">
+          <div className="flex items-center gap-2">
+            <TriangleAlertIcon className="size-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => load()}
+            disabled={loading}
+            className="h-7 shrink-0 text-xs"
+          >
+            Retry
+          </Button>
         </div>
       )}
 
@@ -202,7 +219,7 @@ export default function AvailabilityPage({
             <Skeleton key={d.value} className="h-64 w-full rounded-xl" />
           ))}
         </div>
-      ) : (
+      ) : windows && agents ? (
         /* 7-Column Weekly Scrollable Kanban Board Grid */
         <div className="overflow-x-auto pb-4 timeline-scrollbar">
           <div className="grid grid-cols-7 gap-3.5 min-w-[1470px]">
@@ -393,7 +410,7 @@ export default function AvailabilityPage({
             })}
           </div>
         </div>
-      )}
+      ) : null}
 
       <WindowFormDialog
         companyId={companyId}

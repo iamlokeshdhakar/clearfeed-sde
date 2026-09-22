@@ -8,11 +8,34 @@ export const RETRY_INTERVAL_MS = PENDING_RETRY_INTERVAL_MS;
 export const BATCH_LIMIT = 100;
 
 export interface RetrySweepOptions {
-  /** Overridable for tests; production sweeps use the real current time. */
+  /**
+   * The sweep clock: used only for due-row selection (`lastAttemptedAt`
+   * threshold) and for stamping backoff on a failed row. Overridable for
+   * tests; production sweeps use the real current time.
+   *
+   * This is deliberately NOT forwarded to `assignTicket` — see
+   * `decisionNowForTest` below for why.
+   */
   now?: DateTime;
   limit?: number;
   /** Integration tests bypass the due-time filter to exercise a retry without waiting. */
   bypassAgeFilter?: boolean;
+  /**
+   * Test-only: overrides the decision time `assignTicket` uses for each row,
+   * called fresh per row. Production sweeps never set this, so each
+   * `assignTicket` call captures the real current time after acquiring that
+   * row's company lock, as it normally does.
+   *
+   * A batch can process up to `limit` rows sequentially, and a row may wait
+   * on a company lock, so a later row can be evaluated well after the sweep
+   * started. Stamping every row with the sweep-start time (as this used to
+   * do) could assign an agent who is actually off-shift by then, or skip one
+   * who has just come on shift. Tests that need a fixed clock for a
+   * single-row sweep can pass a constant function; tests that need to
+   * simulate a shift boundary crossing mid-batch can advance the returned
+   * time on each call.
+   */
+  decisionNowForTest?: () => DateTime;
 }
 
 export interface RetrySweepResult {
@@ -30,6 +53,12 @@ export interface RetrySweepResult {
  * removed) is backed off behind the next sweep window instead of being left
  * as the oldest due row, so it cannot crowd out later, still-retryable
  * tickets indefinitely.
+ *
+ * `now` (the sweep clock) only drives due-row selection and backoff
+ * bookkeeping. Each row's actual assignment decision is made with its own
+ * fresh `assignTicket` call, captured after that row acquires its company
+ * lock — not with the sweep-start time — since rows later in a large batch
+ * can be evaluated well after the sweep began.
  */
 export async function runRetrySweep(
   options: RetrySweepOptions = {},
@@ -61,7 +90,7 @@ export async function runRetrySweep(
     try {
       const outcome = await assignTicket(
         { companyId: row.ticket.companyId, ticketId: row.ticketId },
-        { now },
+        options.decisionNowForTest ? { now: options.decisionNowForTest() } : {},
       );
       if (outcome.status === "assigned") {
         result.assigned++;

@@ -30,6 +30,12 @@ const DAY_LABELS: { value: number; label: string }[] = [
 ];
 
 const PX_PER_MINUTE = 0.65;
+const MINUTES_PER_DAY = 24 * 60;
+const DAY_TRACK_WIDTH = MINUTES_PER_DAY * PX_PER_MINUTE;
+const DAY_LABEL_WIDTH = 96; // matches the `w-24` label column below
+const AXIS_GAP = 16; // matches `gap-4` between the label column and the track
+// Every 3 hours: evenly spaced reference points along the 24h axis.
+const HOUR_TICKS = [0, 3, 6, 9, 12, 15, 18, 21];
 
 type Block = {
   kind: "covered" | "gap";
@@ -44,6 +50,12 @@ function formatLocal(iso: string, timezone: string): string {
   return DateTime.fromISO(iso, { setZone: true })
     .setZone(timezone)
     .toFormat("HH:mm");
+}
+
+/** Minutes since local midnight, in `timezone` — this block's position on the 24h axis. */
+function minuteOfDay(iso: string, timezone: string): number {
+  const local = DateTime.fromISO(iso, { setZone: true }).setZone(timezone);
+  return local.hour * 60 + local.minute;
 }
 
 export default function CoveragePage({
@@ -258,23 +270,60 @@ export default function CoveragePage({
                 </div>
               </div>
 
-              {/* Day Visual Rows */}
-              <div className="flex flex-col gap-3 timeline-scrollbar overflow-x-auto pb-2 pt-1">
+              {/* Day Visual Rows, positioned on a shared 24-hour axis so a
+                  block's horizontal position reflects its actual time of
+                  day, not just its place in a list. */}
+              <div className="flex flex-col gap-1 timeline-scrollbar overflow-x-auto pb-2 pt-1">
+                {/* Hour Axis Header */}
+                <div
+                  className="flex items-center gap-4 text-[10px] font-mono text-muted-foreground"
+                  style={{
+                    minWidth: DAY_LABEL_WIDTH + AXIS_GAP + DAY_TRACK_WIDTH,
+                  }}
+                >
+                  <span
+                    className="shrink-0"
+                    style={{ width: DAY_LABEL_WIDTH }}
+                  />
+                  <div
+                    className="relative h-4 shrink-0"
+                    style={{ width: DAY_TRACK_WIDTH }}
+                  >
+                    {HOUR_TICKS.map((hour) => (
+                      <span
+                        key={hour}
+                        className="absolute -translate-x-1/2"
+                        style={{ left: hour * 60 * PX_PER_MINUTE }}
+                      >
+                        {String(hour).padStart(2, "0")}:00
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
                 {DAY_LABELS.map((day) => {
                   const dayBlocks = blocksByDay.get(day.value) ?? [];
                   return (
                     <div
                       key={day.value}
-                      className="flex items-center gap-4 min-w-[580px]"
+                      className="flex items-center gap-4"
+                      style={{
+                        minWidth: DAY_LABEL_WIDTH + AXIS_GAP + DAY_TRACK_WIDTH,
+                      }}
                     >
                       <span className="w-24 shrink-0 text-xs font-bold uppercase tracking-wider text-muted-foreground">
                         {day.label}
                       </span>
-                      <div className="flex min-h-9 flex-1 items-stretch gap-1 rounded-lg bg-muted/30 p-1 border border-border/40">
+                      <div
+                        className="relative h-9 shrink-0 rounded-lg bg-muted/30 border border-border/40"
+                        style={{ width: DAY_TRACK_WIDTH }}
+                      >
                         {dayBlocks.length === 0 ? (
-                          <span className="text-muted-foreground/60 text-xs italic px-2 self-center">
-                            No required support hours configured
-                          </span>
+                          <div className="absolute inset-0 flex items-center px-2">
+                            <span className="text-muted-foreground/60 text-xs italic">
+                              No required support hours configured
+                            </span>
+                          </div>
                         ) : (
                           dayBlocks.map((block, index) => {
                             const duration = DateTime.fromISO(block.end).diff(
@@ -284,15 +333,20 @@ export default function CoveragePage({
                             const isCovered = block.kind === "covered";
                             const agentCount = block.agent_ids?.length ?? 0;
                             const timeRangeStr = `${formatLocal(block.start, coverage.timezone)} - ${formatLocal(block.end, coverage.timezone)}`;
+                            const left = minuteOfDay(
+                              block.start,
+                              coverage.timezone,
+                            );
 
                             return (
                               <div
                                 key={`${block.start}-${index}`}
                                 title={`${timeRangeStr} · ${isCovered ? `${agentCount} active agent(s)` : "Uncovered gap"}`}
                                 style={{
-                                  width: `${Math.max(duration * PX_PER_MINUTE, 6)}px`,
+                                  left: left * PX_PER_MINUTE,
+                                  width: Math.max(duration * PX_PER_MINUTE, 3),
                                 }}
-                                className={`group relative flex items-center justify-center rounded-md text-[10px] font-mono font-medium transition-all duration-150 ${
+                                className={`group absolute top-1 bottom-1 flex items-center justify-center overflow-hidden rounded-md text-[10px] font-mono font-medium transition-all duration-150 ${
                                   isCovered
                                     ? "bg-emerald-500/80 text-white hover:bg-emerald-600 shadow-xs"
                                     : "bg-rose-500/90 text-white hover:bg-rose-600 animate-pulse shadow-xs"

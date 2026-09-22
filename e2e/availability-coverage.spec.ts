@@ -27,8 +27,21 @@ test.afterAll(async () => {
   await prisma.$disconnect();
 });
 
-function extractGapMinutes(headingText: string | null): number {
-  const match = headingText?.match(/\((\d+) min total\)/);
+/**
+ * Reads the total gap minutes from the "Uncovered Gap Breakdown" heading,
+ * e.g. "Uncovered Gap Breakdown (7 gaps · 1439 mins)". This is the one place
+ * the page always renders the current total, regardless of whether the gap
+ * list itself or the "Perfect Support Coverage!" empty state is showing.
+ */
+async function readTotalGapMinutes(
+  page: import("@playwright/test").Page,
+): Promise<number> {
+  const heading = page.getByRole("heading", {
+    name: /Uncovered Gap Breakdown/,
+  });
+  await expect(heading).toBeVisible();
+  const text = await heading.textContent();
+  const match = text?.match(/·\s*(\d+)\s*mins\)/);
   return match ? Number(match[1]) : Number.NaN;
 }
 
@@ -36,30 +49,30 @@ test("creating an overnight window shows its marker and shrinks a coverage gap",
   page,
 }) => {
   await page.goto(`/companies/${companyId}/coverage`);
-  const gapHeading = page.getByRole("heading", { name: /Coverage gaps/ });
-  await expect(gapHeading).toBeVisible();
-  const initialMinutes = extractGapMinutes(await gapHeading.textContent());
+  const initialMinutes = await readTotalGapMinutes(page);
   expect(initialMinutes).toBeGreaterThan(0);
 
   await page.goto(`/companies/${companyId}/availability`);
-  await page.getByRole("button", { name: "Add window" }).click();
+  await page.getByRole("button", { name: "Add Availability Window" }).click();
   await page.getByRole("checkbox", { name: "Monday" }).check();
-  await page.getByLabel("Start time").fill("22:00");
-  await page.getByLabel("End time").fill("06:00");
-  await page.getByRole("button", { name: "Timezone" }).click();
+  await page.getByLabel("Start Time").fill("22:00");
+  await page.getByLabel("End Time").fill("06:00");
+  await page.getByLabel("Shift Timezone").click();
   await page.getByPlaceholder("Search timezones...").fill("Europe/London");
   await page
     .getByRole("option", { name: "Europe/London", exact: true })
     .click();
   await page.getByRole("checkbox", { name: "E2E Agent" }).check();
-  await page.getByRole("button", { name: "Save" }).click();
+  await page.getByRole("button", { name: "Save Window" }).click();
 
-  await expect(page.getByText("22:00 → 06:00")).toBeVisible();
-  await expect(page.getByText("ends next day")).toBeVisible();
+  await expect(page.getByText("22:00 – 06:00")).toBeVisible();
+  // exact: the dialog's own helper text ("Overnight Window: shift wraps
+  // around...") can still be present in the DOM after closing and would
+  // otherwise match too; this targets the card's Overnight badge specifically.
+  await expect(page.getByText("Overnight", { exact: true })).toBeVisible();
 
   await page.goto(`/companies/${companyId}/coverage`);
-  await expect(gapHeading).toBeVisible();
   await expect
-    .poll(async () => extractGapMinutes(await gapHeading.textContent()))
+    .poll(() => readTotalGapMinutes(page))
     .toBeLessThan(initialMinutes);
 });

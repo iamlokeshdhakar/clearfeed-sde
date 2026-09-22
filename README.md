@@ -1,4 +1,4 @@
-# Cleatfeed — Support Ticket Assignment
+# clearfeed — Support Ticket Assignment
 
 Automates support ticket assignment based on agent availability and
 workload, with a UI for managing team schedules and coverage gaps. See
@@ -106,13 +106,13 @@ to exercise the product by hand.
 
 **`prisma/seed-data.json` shape** (one object per company in `companies`):
 
-| Field | Notes |
-| --- | --- |
-| `name`, `supportTimezone`, `maxActiveTicketsPerAgent` | Maps 1:1 to the `Company` model. |
-| `requiredSupportHours[]` | `{ daysOfWeek: number[], startTime, endTime }` in `HH:mm`, one entry expands into one row per day. |
-| `agents[]` | `{ key, name, email, removed? }`. `key` is a local, seed-only alias used to reference the agent elsewhere in the file — it isn't stored. |
-| `windows[]` | `{ daysOfWeek: number[], startTime, endTime, timezone, agentKeys: string[] }`; expands into one `AvailabilityWindow` row per day, same as the create API. |
-| `tickets[]` | `{ status, assigneeKey?, assignedHoursAgo? }`. Omit both optional fields for an unassigned ticket; set both to also create a matching `Assignment` history row (`assignedHoursAgo` back-dates `assignedAt`). |
+| Field                                                 | Notes                                                                                                                                                                                                        |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`, `supportTimezone`, `maxActiveTicketsPerAgent` | Maps 1:1 to the `Company` model.                                                                                                                                                                             |
+| `requiredSupportHours[]`                              | `{ daysOfWeek: number[], startTime, endTime }` in `HH:mm`, one entry expands into one row per day.                                                                                                           |
+| `agents[]`                                            | `{ key, name, email, removed? }`. `key` is a local, seed-only alias used to reference the agent elsewhere in the file — it isn't stored.                                                                     |
+| `windows[]`                                           | `{ daysOfWeek: number[], startTime, endTime, timezone, agentKeys: string[] }`; expands into one `AvailabilityWindow` row per day, same as the create API.                                                    |
+| `tickets[]`                                           | `{ status, assigneeKey?, assignedHoursAgo? }`. Omit both optional fields for an unassigned ticket; set both to also create a matching `Assignment` history row (`assignedHoursAgo` back-dates `assignedAt`). |
 
 `prisma/seed.ts` only reads this file and creates rows — extending the seed
 data never requires touching that script.

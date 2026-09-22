@@ -17,10 +17,18 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 
-const ALL_TIMEZONES: string[] =
-  typeof Intl.supportedValuesOf === "function"
-    ? Intl.supportedValuesOf("timeZone")
-    : ["UTC"];
+// Intl.supportedValuesOf("timeZone") does not include "UTC" on current
+// Node/Chromium runtimes, even though it's a normal, commonly-used schedule
+// zone and the server accepts it. Add it explicitly and dedupe, rather than
+// relying on the browser's list to happen to contain it.
+export const ALL_TIMEZONES: string[] = Array.from(
+  new Set([
+    "UTC",
+    ...(typeof Intl.supportedValuesOf === "function"
+      ? Intl.supportedValuesOf("timeZone")
+      : []),
+  ]),
+);
 
 export function TimezoneCombobox({
   value,

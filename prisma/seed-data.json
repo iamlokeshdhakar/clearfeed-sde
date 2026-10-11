@@ -1,0 +1,135 @@
+{
+  "companies": [
+    {
+      "name": "Scope Seeker Support",
+      "supportTimezone": "America/New_York",
+      "maxActiveTicketsPerAgent": 3,
+      "requiredSupportHours": [
+        {
+          "daysOfWeek": [1, 2, 3, 4, 5],
+          "startTime": "09:00",
+          "endTime": "18:00"
+        },
+        {
+          "daysOfWeek": [6],
+          "startTime": "10:00",
+          "endTime": "14:00",
+          "note": "Left uncovered on purpose to demonstrate a coverage gap."
+        }
+      ],
+      "agents": [
+        {
+          "key": "priya",
+          "name": "Priya Patel",
+          "email": "priya@acme.example"
+        },
+        { "key": "ravi", "name": "Ravi Shah", "email": "ravi@acme.example" },
+        {
+          "key": "jordan",
+          "name": "Jordan Lee",
+          "email": "jordan@acme.example"
+        },
+        {
+          "key": "sam",
+          "name": "Sam Reyes",
+          "email": "sam@acme.example",
+          "removed": true
+        },
+        { "key": "casey", "name": "Casey Kim", "email": "casey@acme.example" }
+      ],
+      "windows": [
+        {
+          "daysOfWeek": [1, 2, 3, 4, 5],
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "timezone": "Asia/Kolkata",
+          "agentKeys": ["priya"],
+          "note": "Partial overlap with company hours once converted to America/New_York."
+        },
+        {
+          "daysOfWeek": [7],
+          "startTime": "22:00",
+          "endTime": "06:00",
+          "timezone": "Europe/London",
+          "agentKeys": ["ravi"],
+          "note": "Overnight, Sunday 22:00 -> Monday 06:00."
+        },
+        {
+          "daysOfWeek": [1, 2, 3, 4, 5],
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "timezone": "America/New_York",
+          "agentKeys": ["jordan"]
+        },
+        {
+          "daysOfWeek": [3],
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "timezone": "America/New_York",
+          "agentKeys": ["sam"],
+          "note": "Stale membership: sam is removed but stays on this window."
+        },
+        {
+          "daysOfWeek": [1, 2, 3, 4, 5],
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "timezone": "America/New_York",
+          "agentKeys": ["casey"]
+        }
+      ],
+      "tickets": [
+        {
+          "status": "OPEN",
+          "assigneeKey": "casey",
+          "assignedHoursAgo": 1,
+          "note": "Casey is already at the 3-ticket limit via these 3 tickets."
+        },
+        { "status": "OPEN", "assigneeKey": "casey", "assignedHoursAgo": 2 },
+        { "status": "OPEN", "assigneeKey": "casey", "assignedHoursAgo": 3 },
+        { "status": "OPEN" },
+        { "status": "RESOLVED" }
+      ]
+    },
+    {
+      "name": "Globex Support",
+      "supportTimezone": "Asia/Kolkata",
+      "maxActiveTicketsPerAgent": 2,
+      "requiredSupportHours": [
+        {
+          "daysOfWeek": [1, 2, 3, 4, 5],
+          "startTime": "09:00",
+          "endTime": "18:00"
+        }
+      ],
+      "agents": [
+        {
+          "key": "meera",
+          "name": "Meera Iyer",
+          "email": "meera@globex.example"
+        },
+        {
+          "key": "liam",
+          "name": "Liam O'Connor",
+          "email": "liam@globex.example"
+        }
+      ],
+      "windows": [
+        {
+          "daysOfWeek": [1, 2, 3, 4, 5],
+          "startTime": "09:00",
+          "endTime": "18:00",
+          "timezone": "Asia/Kolkata",
+          "agentKeys": ["meera"]
+        },
+        {
+          "daysOfWeek": [1, 2, 3, 4, 5],
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "timezone": "Europe/London",
+          "agentKeys": ["liam"]
+        }
+      ],
+      "tickets": [{ "status": "OPEN" }, { "status": "WAITING" }]
+    }
+  ]
+}

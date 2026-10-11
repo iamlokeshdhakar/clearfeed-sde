@@ -1,0 +1,122 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING
+  RESOLVED
+  CLOSED
+}
+
+model Company {
+  id                       String   @id @default(cuid())
+  name                     String
+  supportTimezone          String
+  maxActiveTicketsPerAgent Int
+
+  agents               Agent[]
+  availabilityWindows  AvailabilityWindow[]
+  requiredSupportHours RequiredSupportHours[]
+  tickets              Ticket[]
+}
+
+model Agent {
+  id        String    @id @default(cuid())
+  companyId String
+  name      String
+  email     String
+  removedAt DateTime?
+
+  company              Company                    @relation(fields: [companyId], references: [id])
+  windowMemberships    AvailabilityWindowAgent[]
+  assignedTickets      Ticket[]
+  assignments          Assignment[]
+
+  @@index([companyId, removedAt])
+}
+
+model AvailabilityWindow {
+  id           String   @id @default(cuid())
+  companyId    String
+  dayOfWeek    Int
+  startMinute  Int
+  endMinute    Int
+  timezone     String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company Company                   @relation(fields: [companyId], references: [id])
+  agents  AvailabilityWindowAgent[]
+
+  @@index([companyId, dayOfWeek])
+}
+
+model AvailabilityWindowAgent {
+  windowId String
+  agentId  String
+
+  window AvailabilityWindow @relation(fields: [windowId], references: [id], onDelete: Cascade)
+  agent  Agent              @relation(fields: [agentId], references: [id])
+
+  @@id([windowId, agentId])
+  @@index([agentId])
+}
+
+model RequiredSupportHours {
+  id          String @id @default(cuid())
+  companyId   String
+  dayOfWeek   Int
+  startMinute Int
+  endMinute   Int
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@index([companyId])
+}
+
+model Ticket {
+  id         String       @id @default(cuid())
+  companyId  String
+  status     TicketStatus @default(OPEN)
+  assigneeId String?
+  assignedAt DateTime?
+
+  company          Company           @relation(fields: [companyId], references: [id])
+  assignee         Agent?            @relation(fields: [assigneeId], references: [id])
+  assignment       Assignment?
+  pendingAssignment PendingAssignment?
+
+  @@index([assigneeId, status])
+  @@index([companyId, status])
+}
+
+model Assignment {
+  id          String   @id @default(cuid())
+  ticketId    String   @unique
+  agentId     String
+  assignedAt  DateTime
+  explanation Json
+
+  ticket Ticket @relation(fields: [ticketId], references: [id])
+  agent  Agent  @relation(fields: [agentId], references: [id])
+
+  @@index([agentId, assignedAt])
+}
+
+model PendingAssignment {
+  ticketId        String   @id
+  reasonCode      String
+  firstRequestedAt DateTime @default(now())
+  lastAttemptedAt  DateTime @default(now())
+  attemptCount     Int      @default(1)
+
+  ticket Ticket @relation(fields: [ticketId], references: [id])
+
+  @@index([lastAttemptedAt])
+}
